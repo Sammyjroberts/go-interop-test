@@ -21,23 +21,25 @@ The architecture consists of three main layers:
 ```text
   +--------------------+            +---------------------+
   |   eventlibserver   |  HTTP API  | External systems    |
-  |  (REST + Prometheus)+----------> (curl, Prometheus,  |
+  | (REST + Prometheus)|+---------->| (curl, Prometheus,  |
   +--------------------+            |  mission ops UI...) |
+           |                        +---------------------+
            |
            v
   +--------------------+    Wraps    +------------------+
-  |    eventlibgo      +------------>   CGo Wrapper     |
-  | (Go Callbacks +    |            | (callback shims) |
-  |  Processor Config) |            +------------------+
+  |    eventlibgo      |+----------->|   CGo Wrapper    |
+  | (Go Callbacks +    |             | (callback shims) |
+  |  Processor Config) |             +------------------+
+  +--------------------+
            |
            v
-  +----------------------------+
+  +---------------------------+
   |         eventlib          |
   |   (Pure C Event Engine)   |
   |   - Queue mgmt            |
   |   - Event dispatching     |
   |   - Callback hooks        |
-  +----------------------------+
+  +---------------------------+
 ```
 
 ### Callback Shim Explained
