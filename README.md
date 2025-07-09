@@ -4,7 +4,7 @@
 
 This project demonstrates seamless **C/Go interoperation** to enable **shared event-processing logic** between Flight Software (FSW) and Ground Software (GSW) teams. At its core is a C library (`eventlib`) that delegates behavior through function pointers. These are hooked in via a Go wrapper (`eventlibgo`) and ultimately exposed via a REST API server (`eventlibserver`).
 
-By pushing system-specific side effects (like logging, filtering, or output) into user-defined callbacks from Go, we make the C library portable across mission profiles—from satellites using a message bus to ground stations storing events in Redis.
+By pushing system-specific side effects (like logging, filtering, or output) into user-defined callbacks from Go, we make the C library portable across mission profiles—from satellites using a message bus to ground systems storing events in Redis.
 
 This is a **strategic pattern for aerospace software**: domain-specific behavior lives in a high-level, ergonomic language (Go), while deterministic core logic remains in C.
 
