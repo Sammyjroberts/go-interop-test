@@ -1,0 +1,2000 @@
+---- ./eventlib/eventlib_fixed_pool.c ----
+you fell for it.
+---- ./eventlib/eventlib.h ----
+// eventlib.h - Simple event processing library with callbacks
+#ifndef EVENTLIB_H
+#define EVENTLIB_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+// Forward declarations
+typedef struct event_processor event_processor_t;
+
+// Event types
+typedef enum {
+  EVENT_TYPE_DATA,
+  EVENT_TYPE_CONNECT,
+  EVENT_TYPE_DISCONNECT,
+  EVENT_TYPE_ERROR
+} event_type_t;
+
+// Event structure
+typedef struct {
+  event_type_t type;
+  const char *source;
+  const void *data;
+  size_t data_len;
+} event_t;
+
+// Callback function types (these are your side effects)
+typedef void (*on_event_cb)(const event_t *event, void *user_data);
+typedef void (*on_log_cb)(const char *level, const char *message,
+                          void *user_data);
+typedef bool (*on_filter_cb)(const event_t *event, void *user_data);
+typedef void (*on_state_change_cb)(const char *old_state, const char *new_state,
+                                   void *user_data);
+
+// Configuration structure
+typedef struct {
+  // Basic configuration
+  const char *name;
+  size_t max_queue_size;
+  bool enable_logging;
+
+  // Callback functions
+  on_event_cb on_event;
+  on_log_cb on_log;
+  on_filter_cb on_filter; // Return false to drop event
+  on_state_change_cb on_state_change;
+
+  // User data passed to callbacks
+  void *user_data;
+} event_config_t;
+
+// API Functions
+
+// Create and destroy processor
+event_processor_t *event_processor_create(const event_config_t *config);
+void event_processor_destroy(event_processor_t *processor);
+
+bool event_processor_push(event_processor_t *processor, event_type_t type,
+                          const char *source, const void *data,
+                          size_t data_len);
+
+void event_processor_process(event_processor_t *processor);
+void event_processor_process_all(event_processor_t *processor);
+
+// State management
+const char *event_processor_get_state(const event_processor_t *processor);
+size_t event_processor_queue_size(const event_processor_t *processor);
+size_t event_processor_events_processed(const event_processor_t *processor);
+
+// Control functions
+void event_processor_start(event_processor_t *processor);
+void event_processor_stop(event_processor_t *processor);
+void event_processor_clear_queue(event_processor_t *processor);
+
+#endif // EVENTLIB_H
+---- ./eventlib/eventlib.c ----
+// eventlib.c - Implementation
+#include "eventlib.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+/*
+ * NOTICE TO FLIGHT SOFTWARE ENGINEERS:
+ * This library contains:
+ * - Dynamic memory allocation (malloc/free)
+ * - Linked lists with unbounded growth
+ * - Variable length string operations
+ * - Non-deterministic queue processing times
+ *
+ * Please maintain a safe distance of at least 100,000km (geostationary orbit).
+ * For a flight-certified version, please see eventlib_fixed_pool.c
+ * (just kidding, that doesn't exist)
+ */
+
+// Internal queue node
+typedef struct event_node
+{
+  event_t event;
+  char *source_copy; // Owned copy
+  void *data_copy;   // Owned copy
+  struct event_node *next;
+} event_node_t;
+
+// Internal state
+typedef enum
+{
+  STATE_IDLE,
+  STATE_RUNNING,
+  STATE_STOPPED
+} processor_state_t;
+
+// Main processor structure (internal state)
+struct event_processor
+{
+  // Configuration (immutable after creation)
+  event_config_t config;
+  char *name_copy;
+
+  // Mutable state
+  processor_state_t state;
+  event_node_t *queue_head;
+  event_node_t *queue_tail;
+  size_t queue_size;
+  size_t events_processed;
+};
+
+// Helper to get state string
+static const char *state_to_string(processor_state_t state)
+{
+  switch (state)
+  {
+  case STATE_IDLE:
+    return "IDLE";
+  case STATE_RUNNING:
+    return "RUNNING";
+  case STATE_STOPPED:
+    return "STOPPED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+// Helper to log messages
+static void log_message(event_processor_t *proc, const char *level, const char *format, ...)
+{
+  if (!proc->config.enable_logging || !proc->config.on_log)
+  {
+    return;
+  }
+
+  char buffer[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  proc->config.on_log(level, buffer, proc->config.user_data);
+}
+
+// Helper to change state
+static void change_state(event_processor_t *proc, processor_state_t new_state)
+{
+  if (proc->state == new_state)
+    return;
+
+  const char *old = state_to_string(proc->state);
+  const char *new = state_to_string(new_state);
+
+  log_message(proc, "INFO", "State change: %s -> %s", old, new);
+
+  proc->state = new_state;
+
+  if (proc->config.on_state_change)
+  {
+    proc->config.on_state_change(old, new, proc->config.user_data);
+  }
+}
+
+// Create processor
+event_processor_t *event_processor_create(const event_config_t *config)
+{
+  if (!config)
+    return NULL;
+
+  event_processor_t *proc = calloc(1, sizeof(event_processor_t));
+  if (!proc)
+    return NULL;
+
+  // Copy configuration
+  proc->config = *config;
+  if (config->name)
+  {
+    proc->name_copy = strdup(config->name);
+    proc->config.name = proc->name_copy;
+  }
+
+  // Initialize state
+  proc->state = STATE_IDLE;
+  proc->queue_head = NULL;
+  proc->queue_tail = NULL;
+  proc->queue_size = 0;
+  proc->events_processed = 0;
+
+  log_message(proc, "INFO", "Event processor '%s' created",
+              proc->config.name ? proc->config.name : "unnamed");
+
+  return proc;
+}
+
+// Destroy processor
+void event_processor_destroy(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+
+  log_message(proc, "INFO", "Destroying event processor '%s'",
+              proc->config.name ? proc->config.name : "unnamed");
+
+  // Clear queue
+  event_processor_clear_queue(proc);
+
+  // Free name
+  free(proc->name_copy);
+
+  free(proc);
+}
+
+// Push event to queue
+bool event_processor_push(event_processor_t *proc,
+                          event_type_t type,
+                          const char *source,
+                          const void *data,
+                          size_t data_len)
+{
+  if (!proc)
+    return false;
+
+  // Check queue size
+  if (proc->config.max_queue_size > 0 &&
+      proc->queue_size >= proc->config.max_queue_size)
+  {
+    log_message(proc, "WARN", "Queue full (%zu items)", proc->queue_size);
+    return false;
+  }
+
+  // Create event node
+  event_node_t *node = calloc(1, sizeof(event_node_t));
+  if (!node)
+    return false;
+
+  // Set up event
+  node->event.type = type;
+  node->event.data_len = data_len;
+
+  // Copy source string
+  if (source)
+  {
+    node->source_copy = strdup(source);
+    node->event.source = node->source_copy;
+  }
+
+  // Copy data - malloc with UNBOUNDED SIZE from user input! hehehehe
+  if (data && data_len > 0)
+  {
+    node->data_copy = malloc(data_len);
+    if (node->data_copy)
+    {
+      memcpy(node->data_copy, data, data_len);
+      node->event.data = node->data_copy;
+    }
+  }
+
+  // Apply filter if configured
+  if (proc->config.on_filter)
+  {
+    if (!proc->config.on_filter(&node->event, proc->config.user_data))
+    {
+      log_message(proc, "DEBUG", "Event filtered out");
+      free(node->source_copy);
+      free(node->data_copy);
+      free(node);
+      return true; // Successfully "processed" by filtering
+    }
+  }
+
+  // Add to queue
+  if (proc->queue_tail)
+  {
+    proc->queue_tail->next = node;
+    proc->queue_tail = node;
+  }
+  else
+  {
+    proc->queue_head = proc->queue_tail = node;
+  }
+
+  proc->queue_size++;
+  log_message(proc, "DEBUG", "Event queued (type=%d, queue_size=%zu)",
+              type, proc->queue_size);
+
+  return true;
+}
+
+// Process single event
+void event_processor_process(event_processor_t *proc)
+{
+  if (!proc || !proc->queue_head)
+    return;
+
+  if (proc->state != STATE_RUNNING)
+  {
+    log_message(proc, "WARN", "Processor not running");
+    return;
+  }
+
+  // Remove from queue
+  event_node_t *node = proc->queue_head;
+  proc->queue_head = node->next;
+  if (!proc->queue_head)
+  {
+    proc->queue_tail = NULL;
+  }
+  proc->queue_size--;
+
+  // Process event (side effect)
+  log_message(proc, "DEBUG", "Processing event (type=%d)", node->event.type);
+
+  if (proc->config.on_event)
+  {
+    proc->config.on_event(&node->event, proc->config.user_data);
+  }
+
+  proc->events_processed++;
+
+  // Cleanup
+  free(node->source_copy);
+  free(node->data_copy);
+  free(node);
+}
+
+// Process all events
+void event_processor_process_all(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+
+  size_t count = 0;
+  while (proc->queue_head)
+  {
+    event_processor_process(proc);
+    count++;
+  }
+
+  if (count > 0)
+  {
+    log_message(proc, "INFO", "Processed %zu events", count);
+  }
+}
+
+// State getters
+const char *event_processor_get_state(const event_processor_t *proc)
+{
+  return proc ? state_to_string(proc->state) : "INVALID";
+}
+
+size_t event_processor_queue_size(const event_processor_t *proc)
+{
+  return proc ? proc->queue_size : 0;
+}
+
+size_t event_processor_events_processed(const event_processor_t *proc)
+{
+  return proc ? proc->events_processed : 0;
+}
+
+// Control functions
+void event_processor_start(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+  change_state(proc, STATE_RUNNING);
+}
+
+void event_processor_stop(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+  change_state(proc, STATE_STOPPED);
+}
+
+void event_processor_clear_queue(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+
+  size_t cleared = 0;
+  while (proc->queue_head)
+  {
+    event_node_t *node = proc->queue_head;
+    proc->queue_head = node->next;
+
+    free(node->source_copy);
+    free(node->data_copy);
+    free(node);
+    cleared++;
+  }
+
+  proc->queue_tail = NULL;
+  proc->queue_size = 0;
+
+  if (cleared > 0)
+  {
+    log_message(proc, "INFO", "Cleared %zu events from queue", cleared);
+  }
+}
+---- ./docker-compose.yaml ----
+services:
+  eventlib-server:
+    build:
+      context: .
+      dockerfile: ./eventlibserver/Dockerfile
+    container_name: eventlib-server
+    ports:
+      - "8080:8080" # API port
+      - "9090:9090" # Metrics port
+    environment:
+      - LOG_LEVEL=info
+    command:
+      - "-addr=:8080"
+      - "-metrics-addr=:9090"
+      - "-queue-size=10000"
+      - "-name=DockerEventProcessor"
+    restart: unless-stopped
+    networks:
+      - eventlib-network
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:8080/api/v1/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  eventlib-network:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+
+---- ./eventlibserver/Dockerfile ----
+FROM golang:1.24-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache gcc musl-dev make
+
+# Set working directory
+WORKDIR /build
+
+# Copy go workspace file
+COPY go.work go.work
+
+# Copy all modules
+COPY eventlib/ ./eventlib/
+COPY eventlibgo/ ./eventlibgo/
+COPY eventlibserver/ ./eventlibserver/
+
+# Build C library
+WORKDIR /build/eventlib
+RUN gcc -c -fPIC -O2 eventlib.c -o eventlib.o && \
+  ar rcs libeventlib.a eventlib.o && \
+  rm eventlib.o
+
+# Download Go dependencies using workspace
+WORKDIR /build
+RUN go mod download all
+
+# Build the server
+WORKDIR /build/eventlibserver
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o eventlib-server .
+
+# Runtime stage
+FROM alpine:latest
+
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates
+
+# Create non-root user
+RUN addgroup -g 1000 appuser && \
+  adduser -D -u 1000 -G appuser appuser
+
+# Copy binary from builder
+COPY --from=builder /build/eventlibserver/eventlib-server /usr/local/bin/eventlib-server
+
+# Change ownership
+RUN chown appuser:appuser /usr/local/bin/eventlib-server
+
+# Use non-root user
+USER appuser
+
+# Expose ports
+EXPOSE 8080 9090
+
+
+# Run the server
+ENTRYPOINT ["eventlib-server"]
+---- ./eventlibgo/eventlib.go ----
+package eventlib
+
+/*
+#cgo CFLAGS: -I${SRCDIR}/../eventlib
+#cgo LDFLAGS: ${SRCDIR}/../eventlib/libeventlib.a
+#include "eventlib.h"
+#include <stdlib.h>
+
+// Forward declarations for Go callbacks
+extern void goHandleEvent(void* event, void* user_data);
+extern void goHandleLog(void* level, void* message, void* user_data);
+extern int goHandleFilter(void* event, void* user_data);
+extern void goHandleStateChange(void* old_state, void* new_state, void* user_data);
+
+// C wrapper functions that call Go
+static void c_handle_event(const event_t* event, void* user_data) {
+    goHandleEvent((void*)event, user_data);
+}
+
+static void c_handle_log(const char* level, const char* message, void* user_data) {
+    goHandleLog((void*)level, (void*)message, user_data);
+}
+
+static bool c_handle_filter(const event_t* event, void* user_data) {
+    return goHandleFilter((void*)event, user_data) != 0;
+}
+
+static void c_handle_state_change(const char* old_state, const char* new_state, void* user_data) {
+    goHandleStateChange((void*)old_state, (void*)new_state, user_data);
+}
+
+// Helper to create processor with Go callbacks
+static event_processor_t* create_processor_go(const char* name, size_t max_queue_size,
+                                              bool enable_logging, void* user_data) {
+    event_config_t config = {
+        .name = name,
+        .max_queue_size = max_queue_size,
+        .enable_logging = enable_logging,
+        .on_event = c_handle_event,
+        .on_log = c_handle_log,
+        .on_filter = c_handle_filter,
+        .on_state_change = c_handle_state_change,
+        .user_data = user_data
+    };
+    return event_processor_create(&config);
+}
+*/
+import "C"
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"unsafe"
+
+	"go.uber.org/zap"
+)
+
+// EventProcessor wraps the C event processor
+type EventProcessor struct {
+	cptr     *C.event_processor_t
+	config   *Config
+	handlers *Handlers
+	logger   *zap.Logger
+	mu       sync.RWMutex
+	closed   bool
+}
+
+// Config holds processor configuration
+type Config struct {
+	Name          string
+	MaxQueueSize  int
+	EnableLogging bool
+	Logger        *zap.Logger
+}
+
+// Handlers contains all callback functions
+type Handlers struct {
+	OnEvent       EventHandler
+	OnFilter      FilterHandler
+	OnStateChange StateChangeHandler
+}
+
+// New creates a new event processor
+func New(config *Config, handlers *Handlers) (*EventProcessor, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if handlers == nil {
+		handlers = &Handlers{}
+	}
+
+	// Default logger if not provided
+	logger := config.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	ep := &EventProcessor{
+		config:   config,
+		handlers: handlers,
+		logger:   logger,
+	}
+
+	// Store in global map for callback access
+	callbackMu.Lock()
+	callbackID := nextCallbackID
+	nextCallbackID++
+	callbackMap[callbackID] = ep
+	callbackMu.Unlock()
+
+	// Create C processor
+	cName := C.CString(config.Name)
+	defer C.free(unsafe.Pointer(cName))
+
+	ep.cptr = C.create_processor_go(
+		cName,
+		C.size_t(config.MaxQueueSize),
+		C.bool(config.EnableLogging),
+		unsafe.Pointer(uintptr(callbackID)),
+	)
+
+	if ep.cptr == nil {
+		callbackMu.Lock()
+		delete(callbackMap, callbackID)
+		callbackMu.Unlock()
+		return nil, fmt.Errorf("failed to create processor")
+	}
+
+	// Set finalizer to ensure cleanup
+	runtime.SetFinalizer(ep, (*EventProcessor).finalize)
+
+	ep.logger.Info("Event processor created",
+		zap.String("name", config.Name),
+		zap.Int("maxQueueSize", config.MaxQueueSize))
+
+	return ep, nil
+}
+
+// Start starts the processor
+func (ep *EventProcessor) Start() error {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if ep.closed {
+		return fmt.Errorf("processor is closed")
+	}
+
+	C.event_processor_start(ep.cptr)
+	return nil
+}
+
+// Stop stops the processor
+func (ep *EventProcessor) Stop() error {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if ep.closed {
+		return fmt.Errorf("processor is closed")
+	}
+
+	C.event_processor_stop(ep.cptr)
+	return nil
+}
+
+// Push adds an event to the queue
+func (ep *EventProcessor) Push(event Event) error {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if ep.closed {
+		return fmt.Errorf("processor is closed")
+	}
+
+	cSource := C.CString(event.Source)
+	defer C.free(unsafe.Pointer(cSource))
+
+	var dataPtr unsafe.Pointer
+	if len(event.Data) > 0 {
+		dataPtr = unsafe.Pointer(&event.Data[0])
+	}
+
+	success := C.event_processor_push(
+		ep.cptr,
+		C.event_type_t(event.Type),
+		cSource,
+		dataPtr,
+		C.size_t(len(event.Data)),
+	)
+
+	if !success {
+		return fmt.Errorf("failed to push event")
+	}
+
+	return nil
+}
+
+// Process processes a single event
+func (ep *EventProcessor) Process() {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if ep.closed {
+		return
+	}
+
+	C.event_processor_process(ep.cptr)
+}
+
+// ProcessAll processes all queued events
+func (ep *EventProcessor) ProcessAll() {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if ep.closed {
+		return
+	}
+
+	C.event_processor_process_all(ep.cptr)
+}
+
+// QueueSize returns the current queue size
+func (ep *EventProcessor) QueueSize() int {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if ep.closed {
+		return 0
+	}
+
+	return int(C.event_processor_queue_size(ep.cptr))
+}
+
+// EventsProcessed returns total events processed
+func (ep *EventProcessor) EventsProcessed() int {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if ep.closed {
+		return 0
+	}
+
+	return int(C.event_processor_events_processed(ep.cptr))
+}
+
+// State returns the current processor state
+func (ep *EventProcessor) State() string {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if ep.closed {
+		return "CLOSED"
+	}
+
+	return C.GoString(C.event_processor_get_state(ep.cptr))
+}
+
+// Close closes the processor and frees resources
+func (ep *EventProcessor) Close() error {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if ep.closed {
+		return nil
+	}
+
+	ep.closed = true
+
+	// Clean up C resources
+	if ep.cptr != nil {
+		C.event_processor_destroy(ep.cptr)
+		ep.cptr = nil
+	}
+
+	// Remove from callback map
+	callbackMu.Lock()
+	for id, proc := range callbackMap {
+		if proc == ep {
+			delete(callbackMap, id)
+			break
+		}
+	}
+	callbackMu.Unlock()
+
+	ep.logger.Info("Event processor closed",
+		zap.String("name", ep.config.Name))
+
+	return nil
+}
+
+// finalize is called by GC if Close wasn't called
+func (ep *EventProcessor) finalize() {
+	if !ep.closed {
+		ep.Close()
+	}
+}
+
+---- ./eventlibgo/callbacks.go ----
+package eventlib
+
+/*
+#include "../eventlib/eventlib.h"
+*/
+import "C"
+import (
+	"sync"
+	"unsafe"
+
+	"go.uber.org/zap"
+)
+
+// Global map to store processor references for callbacks
+var (
+	callbackMap    = make(map[int]*EventProcessor)
+	callbackMu     sync.RWMutex
+	nextCallbackID int
+)
+
+// getProcessor retrieves processor from callback ID
+func getProcessor(userData unsafe.Pointer) *EventProcessor {
+	id := int(uintptr(userData))
+	callbackMu.RLock()
+	defer callbackMu.RUnlock()
+	return callbackMap[id]
+}
+
+//export goHandleEvent
+func goHandleEvent(eventPtr unsafe.Pointer, userData unsafe.Pointer) {
+	ep := getProcessor(userData)
+	if ep == nil || ep.handlers.OnEvent == nil {
+		return
+	}
+
+	// Convert C event to Go event
+	cEvent := (*C.event_t)(eventPtr)
+	event := Event{
+		Type:   EventType(cEvent._type),
+		Source: C.GoString(cEvent.source),
+	}
+
+	if cEvent.data != nil && cEvent.data_len > 0 {
+		event.Data = C.GoBytes(cEvent.data, C.int(cEvent.data_len))
+	}
+
+	// Call handler with recovery
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ep.logger.Error("Panic in event handler",
+					zap.Any("panic", r),
+					zap.String("event_type", event.Type.String()))
+			}
+		}()
+		ep.handlers.OnEvent(event)
+	}()
+}
+
+//export goHandleLog
+func goHandleLog(levelPtr unsafe.Pointer, messagePtr unsafe.Pointer, userData unsafe.Pointer) {
+	ep := getProcessor(userData)
+	if ep == nil {
+		return
+	}
+
+	level := C.GoString((*C.char)(levelPtr))
+	message := C.GoString((*C.char)(messagePtr))
+
+	// Map C log levels to zap
+	switch level {
+	case "DEBUG":
+		ep.logger.Debug(message)
+	case "INFO":
+		ep.logger.Info(message)
+	case "WARN":
+		ep.logger.Warn(message)
+	case "ERROR":
+		ep.logger.Error(message)
+	default:
+		ep.logger.Info(message, zap.String("level", level))
+	}
+}
+
+//export goHandleFilter
+func goHandleFilter(eventPtr unsafe.Pointer, userData unsafe.Pointer) C.int {
+	ep := getProcessor(userData)
+	if ep == nil || ep.handlers.OnFilter == nil {
+		return 1 // Default: don't filter
+	}
+
+	// Convert C event to Go event
+	cEvent := (*C.event_t)(eventPtr)
+	event := Event{
+		Type:   EventType(cEvent._type),
+		Source: C.GoString(cEvent.source),
+	}
+
+	if cEvent.data != nil && cEvent.data_len > 0 {
+		event.Data = C.GoBytes(cEvent.data, C.int(cEvent.data_len))
+	}
+
+	// Call filter with recovery
+	allow := true
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ep.logger.Error("Panic in filter handler",
+					zap.Any("panic", r))
+				allow = true // Default to allowing on error
+			}
+		}()
+		allow = ep.handlers.OnFilter(event)
+	}()
+
+	if allow {
+		return 1
+	}
+	return 0
+}
+
+//export goHandleStateChange
+func goHandleStateChange(oldStatePtr unsafe.Pointer, newStatePtr unsafe.Pointer, userData unsafe.Pointer) {
+	ep := getProcessor(userData)
+	if ep == nil || ep.handlers.OnStateChange == nil {
+		return
+	}
+
+	oldState := C.GoString((*C.char)(oldStatePtr))
+	newState := C.GoString((*C.char)(newStatePtr))
+
+	// Call handler with recovery
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ep.logger.Error("Panic in state change handler",
+					zap.Any("panic", r))
+			}
+		}()
+		ep.handlers.OnStateChange(oldState, newState)
+	}()
+}
+
+---- ./eventlibgo/types.go ----
+package eventlib
+
+// EventType represents the type of event
+type EventType int
+
+const (
+	EventTypeData       EventType = 0
+	EventTypeConnect    EventType = 1
+	EventTypeDisconnect EventType = 2
+	EventTypeError      EventType = 3
+)
+
+func (et EventType) String() string {
+	switch et {
+	case EventTypeData:
+		return "DATA"
+	case EventTypeConnect:
+		return "CONNECT"
+	case EventTypeDisconnect:
+		return "DISCONNECT"
+	case EventTypeError:
+		return "ERROR"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// Event represents an event in the system
+type Event struct {
+	Type   EventType
+	Source string
+	Data   []byte
+}
+
+// Handler function types
+type (
+	EventHandler       func(event Event)
+	FilterHandler      func(event Event) bool
+	StateChangeHandler func(oldState, newState string)
+)
+
+---- ./eventlib/eventlib_fixed_pool.c ----
+you fell for it.
+---- ./eventlib/eventlib.h ----
+// eventlib.h - Simple event processing library with callbacks
+#ifndef EVENTLIB_H
+#define EVENTLIB_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+// Forward declarations
+typedef struct event_processor event_processor_t;
+
+// Event types
+typedef enum {
+  EVENT_TYPE_DATA,
+  EVENT_TYPE_CONNECT,
+  EVENT_TYPE_DISCONNECT,
+  EVENT_TYPE_ERROR
+} event_type_t;
+
+// Event structure
+typedef struct {
+  event_type_t type;
+  const char *source;
+  const void *data;
+  size_t data_len;
+} event_t;
+
+// Callback function types (these are your side effects)
+typedef void (*on_event_cb)(const event_t *event, void *user_data);
+typedef void (*on_log_cb)(const char *level, const char *message,
+                          void *user_data);
+typedef bool (*on_filter_cb)(const event_t *event, void *user_data);
+typedef void (*on_state_change_cb)(const char *old_state, const char *new_state,
+                                   void *user_data);
+
+// Configuration structure
+typedef struct {
+  // Basic configuration
+  const char *name;
+  size_t max_queue_size;
+  bool enable_logging;
+
+  // Callback functions
+  on_event_cb on_event;
+  on_log_cb on_log;
+  on_filter_cb on_filter; // Return false to drop event
+  on_state_change_cb on_state_change;
+
+  // User data passed to callbacks
+  void *user_data;
+} event_config_t;
+
+// API Functions
+
+// Create and destroy processor
+event_processor_t *event_processor_create(const event_config_t *config);
+void event_processor_destroy(event_processor_t *processor);
+
+bool event_processor_push(event_processor_t *processor, event_type_t type,
+                          const char *source, const void *data,
+                          size_t data_len);
+
+void event_processor_process(event_processor_t *processor);
+void event_processor_process_all(event_processor_t *processor);
+
+// State management
+const char *event_processor_get_state(const event_processor_t *processor);
+size_t event_processor_queue_size(const event_processor_t *processor);
+size_t event_processor_events_processed(const event_processor_t *processor);
+
+// Control functions
+void event_processor_start(event_processor_t *processor);
+void event_processor_stop(event_processor_t *processor);
+void event_processor_clear_queue(event_processor_t *processor);
+
+#endif // EVENTLIB_H
+---- ./eventlib/eventlib.c ----
+// eventlib.c - Implementation
+#include "eventlib.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+/*
+ * NOTICE TO FLIGHT SOFTWARE ENGINEERS:
+ * This library contains:
+ * - Dynamic memory allocation (malloc/free)
+ * - Linked lists with unbounded growth
+ * - Variable length string operations
+ * - Non-deterministic queue processing times
+ *
+ * Please maintain a safe distance of at least 100,000km (geostationary orbit).
+ * For a flight-certified version, please see eventlib_fixed_pool.c
+ * (just kidding, that doesn't exist)
+ */
+
+// Internal queue node
+typedef struct event_node
+{
+  event_t event;
+  char *source_copy; // Owned copy
+  void *data_copy;   // Owned copy
+  struct event_node *next;
+} event_node_t;
+
+// Internal state
+typedef enum
+{
+  STATE_IDLE,
+  STATE_RUNNING,
+  STATE_STOPPED
+} processor_state_t;
+
+// Main processor structure (internal state)
+struct event_processor
+{
+  // Configuration (immutable after creation)
+  event_config_t config;
+  char *name_copy;
+
+  // Mutable state
+  processor_state_t state;
+  event_node_t *queue_head;
+  event_node_t *queue_tail;
+  size_t queue_size;
+  size_t events_processed;
+};
+
+// Helper to get state string
+static const char *state_to_string(processor_state_t state)
+{
+  switch (state)
+  {
+  case STATE_IDLE:
+    return "IDLE";
+  case STATE_RUNNING:
+    return "RUNNING";
+  case STATE_STOPPED:
+    return "STOPPED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+// Helper to log messages
+static void log_message(event_processor_t *proc, const char *level, const char *format, ...)
+{
+  if (!proc->config.enable_logging || !proc->config.on_log)
+  {
+    return;
+  }
+
+  char buffer[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  proc->config.on_log(level, buffer, proc->config.user_data);
+}
+
+// Helper to change state
+static void change_state(event_processor_t *proc, processor_state_t new_state)
+{
+  if (proc->state == new_state)
+    return;
+
+  const char *old = state_to_string(proc->state);
+  const char *new = state_to_string(new_state);
+
+  log_message(proc, "INFO", "State change: %s -> %s", old, new);
+
+  proc->state = new_state;
+
+  if (proc->config.on_state_change)
+  {
+    proc->config.on_state_change(old, new, proc->config.user_data);
+  }
+}
+
+// Create processor
+event_processor_t *event_processor_create(const event_config_t *config)
+{
+  if (!config)
+    return NULL;
+
+  event_processor_t *proc = calloc(1, sizeof(event_processor_t));
+  if (!proc)
+    return NULL;
+
+  // Copy configuration
+  proc->config = *config;
+  if (config->name)
+  {
+    proc->name_copy = strdup(config->name);
+    proc->config.name = proc->name_copy;
+  }
+
+  // Initialize state
+  proc->state = STATE_IDLE;
+  proc->queue_head = NULL;
+  proc->queue_tail = NULL;
+  proc->queue_size = 0;
+  proc->events_processed = 0;
+
+  log_message(proc, "INFO", "Event processor '%s' created",
+              proc->config.name ? proc->config.name : "unnamed");
+
+  return proc;
+}
+
+// Destroy processor
+void event_processor_destroy(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+
+  log_message(proc, "INFO", "Destroying event processor '%s'",
+              proc->config.name ? proc->config.name : "unnamed");
+
+  // Clear queue
+  event_processor_clear_queue(proc);
+
+  // Free name
+  free(proc->name_copy);
+
+  free(proc);
+}
+
+// Push event to queue
+bool event_processor_push(event_processor_t *proc,
+                          event_type_t type,
+                          const char *source,
+                          const void *data,
+                          size_t data_len)
+{
+  if (!proc)
+    return false;
+
+  // Check queue size
+  if (proc->config.max_queue_size > 0 &&
+      proc->queue_size >= proc->config.max_queue_size)
+  {
+    log_message(proc, "WARN", "Queue full (%zu items)", proc->queue_size);
+    return false;
+  }
+
+  // Create event node
+  event_node_t *node = calloc(1, sizeof(event_node_t));
+  if (!node)
+    return false;
+
+  // Set up event
+  node->event.type = type;
+  node->event.data_len = data_len;
+
+  // Copy source string
+  if (source)
+  {
+    node->source_copy = strdup(source);
+    node->event.source = node->source_copy;
+  }
+
+  // Copy data - malloc with UNBOUNDED SIZE from user input! hehehehe
+  if (data && data_len > 0)
+  {
+    node->data_copy = malloc(data_len);
+    if (node->data_copy)
+    {
+      memcpy(node->data_copy, data, data_len);
+      node->event.data = node->data_copy;
+    }
+  }
+
+  // Apply filter if configured
+  if (proc->config.on_filter)
+  {
+    if (!proc->config.on_filter(&node->event, proc->config.user_data))
+    {
+      log_message(proc, "DEBUG", "Event filtered out");
+      free(node->source_copy);
+      free(node->data_copy);
+      free(node);
+      return true; // Successfully "processed" by filtering
+    }
+  }
+
+  // Add to queue
+  if (proc->queue_tail)
+  {
+    proc->queue_tail->next = node;
+    proc->queue_tail = node;
+  }
+  else
+  {
+    proc->queue_head = proc->queue_tail = node;
+  }
+
+  proc->queue_size++;
+  log_message(proc, "DEBUG", "Event queued (type=%d, queue_size=%zu)",
+              type, proc->queue_size);
+
+  return true;
+}
+
+// Process single event
+void event_processor_process(event_processor_t *proc)
+{
+  if (!proc || !proc->queue_head)
+    return;
+
+  if (proc->state != STATE_RUNNING)
+  {
+    log_message(proc, "WARN", "Processor not running");
+    return;
+  }
+
+  // Remove from queue
+  event_node_t *node = proc->queue_head;
+  proc->queue_head = node->next;
+  if (!proc->queue_head)
+  {
+    proc->queue_tail = NULL;
+  }
+  proc->queue_size--;
+
+  // Process event (side effect)
+  log_message(proc, "DEBUG", "Processing event (type=%d)", node->event.type);
+
+  if (proc->config.on_event)
+  {
+    proc->config.on_event(&node->event, proc->config.user_data);
+  }
+
+  proc->events_processed++;
+
+  // Cleanup
+  free(node->source_copy);
+  free(node->data_copy);
+  free(node);
+}
+
+// Process all events
+void event_processor_process_all(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+
+  size_t count = 0;
+  while (proc->queue_head)
+  {
+    event_processor_process(proc);
+    count++;
+  }
+
+  if (count > 0)
+  {
+    log_message(proc, "INFO", "Processed %zu events", count);
+  }
+}
+
+// State getters
+const char *event_processor_get_state(const event_processor_t *proc)
+{
+  return proc ? state_to_string(proc->state) : "INVALID";
+}
+
+size_t event_processor_queue_size(const event_processor_t *proc)
+{
+  return proc ? proc->queue_size : 0;
+}
+
+size_t event_processor_events_processed(const event_processor_t *proc)
+{
+  return proc ? proc->events_processed : 0;
+}
+
+// Control functions
+void event_processor_start(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+  change_state(proc, STATE_RUNNING);
+}
+
+void event_processor_stop(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+  change_state(proc, STATE_STOPPED);
+}
+
+void event_processor_clear_queue(event_processor_t *proc)
+{
+  if (!proc)
+    return;
+
+  size_t cleared = 0;
+  while (proc->queue_head)
+  {
+    event_node_t *node = proc->queue_head;
+    proc->queue_head = node->next;
+
+    free(node->source_copy);
+    free(node->data_copy);
+    free(node);
+    cleared++;
+  }
+
+  proc->queue_tail = NULL;
+  proc->queue_size = 0;
+
+  if (cleared > 0)
+  {
+    log_message(proc, "INFO", "Cleared %zu events from queue", cleared);
+  }
+}
+---- ./docker-compose.yaml ----
+services:
+  eventlib-server:
+    build:
+      context: .
+      dockerfile: ./eventlibserver/Dockerfile
+    container_name: eventlib-server
+    ports:
+      - "8080:8080" # API port
+      - "9090:9090" # Metrics port
+    environment:
+      - LOG_LEVEL=info
+    command:
+      - "-addr=:8080"
+      - "-metrics-addr=:9090"
+      - "-queue-size=10000"
+      - "-name=DockerEventProcessor"
+    restart: unless-stopped
+    networks:
+      - eventlib-network
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:8080/api/v1/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  eventlib-network:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+
+---- ./eventlibserver/main.go ----
+package main
+
+import (
+	"context"
+	"flag"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
+)
+
+var (
+	addr          = flag.String("addr", ":8080", "HTTP server address")
+	metricsAddr   = flag.String("metrics-addr", ":9090", "Metrics server address")
+	queueSize     = flag.Int("queue-size", 10000, "Maximum event queue size")
+	processorName = flag.String("name", "HTTPEventProcessor", "Processor name")
+)
+
+func main() {
+	flag.Parse()
+
+	// Initialize logger
+	logger, err := zap.NewProduction()
+	if err != nil {
+		panic(err)
+	}
+	defer logger.Sync()
+
+	// Create server
+	srv, err := NewServer(*processorName, *queueSize, logger)
+	if err != nil {
+		logger.Fatal("Failed to create server", zap.Error(err))
+	}
+	defer srv.Close()
+
+	// Setup routes
+	router := mux.NewRouter()
+
+	// API routes
+	api := router.PathPrefix("/api/v1").Subrouter()
+	api.Use(srv.loggingMiddleware)
+	api.Use(srv.metricsMiddleware)
+
+	api.HandleFunc("/events", srv.handlePostEvent).Methods("POST")
+	api.HandleFunc("/events/batch", srv.handleBatchEvents).Methods("POST")
+	api.HandleFunc("/process", srv.handleProcess).Methods("POST")
+	api.HandleFunc("/process/all", srv.handleProcessAll).Methods("POST")
+	api.HandleFunc("/status", srv.handleStatus).Methods("GET")
+	api.HandleFunc("/health", srv.handleHealth).Methods("GET")
+
+	// Metrics server
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsServer := &http.Server{
+		Addr:    *metricsAddr,
+		Handler: metricsMux,
+	}
+
+	// Start servers
+	httpServer := &http.Server{
+		Addr:         *addr,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Graceful shutdown
+	done := make(chan struct{})
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		<-sigChan
+
+		logger.Info("Shutting down servers...")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		httpServer.Shutdown(ctx)
+		metricsServer.Shutdown(ctx)
+		close(done)
+	}()
+
+	// Start metrics server
+	go func() {
+		logger.Info("Starting metrics server", zap.String("addr", *metricsAddr))
+		if err := metricsServer.ListenAndServe(); err != http.ErrServerClosed {
+			logger.Error("Metrics server error", zap.Error(err))
+		}
+	}()
+
+	// Start main server
+	logger.Info("Starting HTTP server", zap.String("addr", *addr))
+	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		logger.Fatal("HTTP server error", zap.Error(err))
+	}
+
+	<-done
+	logger.Info("Server stopped")
+}
+
+---- ./eventlibserver/Dockerfile ----
+FROM golang:1.24-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache gcc musl-dev make
+
+# Set working directory
+WORKDIR /build
+
+# Copy go workspace file
+COPY go.work go.work
+
+# Copy all modules
+COPY eventlib/ ./eventlib/
+COPY eventlibgo/ ./eventlibgo/
+COPY eventlibserver/ ./eventlibserver/
+
+# Build C library
+WORKDIR /build/eventlib
+RUN gcc -c -fPIC -O2 eventlib.c -o eventlib.o && \
+  ar rcs libeventlib.a eventlib.o && \
+  rm eventlib.o
+
+# Download Go dependencies using workspace
+WORKDIR /build
+RUN go mod download all
+
+# Build the server
+WORKDIR /build/eventlibserver
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o eventlib-server .
+
+# Runtime stage
+FROM alpine:latest
+
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates
+
+# Create non-root user
+RUN addgroup -g 1000 appuser && \
+  adduser -D -u 1000 -G appuser appuser
+
+# Copy binary from builder
+COPY --from=builder /build/eventlibserver/eventlib-server /usr/local/bin/eventlib-server
+
+# Change ownership
+RUN chown appuser:appuser /usr/local/bin/eventlib-server
+
+# Use non-root user
+USER appuser
+
+# Expose ports
+EXPOSE 8080 9090
+
+
+# Run the server
+ENTRYPOINT ["eventlib-server"]
+---- ./eventlibserver/handlers.go ----
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	eventlib "github.com/sammyjroberts/eventlibgo"
+	"go.uber.org/zap"
+)
+
+var (
+	eventsReceived = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "eventlibgo_http_events_received_total",
+		Help: "Total number of events received via HTTP",
+	}, []string{"type", "source"})
+
+	eventsProcessed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "eventlibgo_http_events_processed_total",
+		Help: "Total number of events processed",
+	}, []string{"type", "source"})
+
+	queueSizeGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "eventlibgo_http_queue_size",
+		Help: "Current event queue size",
+	})
+
+	processingDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "eventlibgo_http_processing_duration_seconds",
+		Help:    "Event processing duration",
+		Buckets: prometheus.DefBuckets,
+	})
+)
+
+// Server wraps the event processor with HTTP handlers
+type Server struct {
+	processor *eventlib.EventProcessor
+	logger    *zap.Logger
+
+	// Event broadcasting
+	eventBroadcast chan eventlib.Event
+}
+
+// NewServer creates a new HTTP server wrapping the event processor
+func NewServer(name string, queueSize int, logger *zap.Logger) (*Server, error) {
+	s := &Server{}
+
+	// Configure processor
+	config := &eventlib.Config{
+		Name:          name,
+		MaxQueueSize:  queueSize,
+		EnableLogging: true,
+		Logger:        logger,
+	}
+
+	handlers := &eventlib.Handlers{
+		OnEvent:       s.onEvent,
+		OnFilter:      s.onFilter,
+		OnStateChange: s.onStateChange,
+	}
+
+	processor, err := eventlib.New(config, handlers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create processor: %w", err)
+	}
+
+	s.processor = processor
+
+	// Start processor
+	if err := processor.Start(); err != nil {
+		processor.Close()
+		return nil, fmt.Errorf("failed to start processor: %w", err)
+	}
+
+	// Start background tasks
+	go s.updateMetrics()
+	go s.broadcastEvents()
+
+	return s, nil
+}
+
+// Close shuts down the server
+func (s *Server) Close() error {
+	close(s.eventBroadcast)
+	return s.processor.Close()
+}
+
+// Event handlers
+func (s *Server) onEvent(event eventlib.Event) {
+	eventsProcessed.WithLabelValues(
+		event.Type.String(),
+		event.Source,
+	).Inc()
+
+	s.logger.Info("Event processed",
+		zap.String("type", event.Type.String()),
+		zap.String("source", event.Source),
+		zap.Int("data_len", len(event.Data)))
+}
+
+func (s *Server) onFilter(event eventlib.Event) bool {
+	// Example: filter out events from "blocked" sources
+	if event.Source == "blocked" {
+		s.logger.Debug("Event filtered",
+			zap.String("source", event.Source))
+		return false
+	}
+	return true
+}
+
+func (s *Server) onStateChange(oldState, newState string) {
+	s.logger.Info("Processor state changed",
+		zap.String("from", oldState),
+		zap.String("to", newState))
+}
+
+// HTTP handlers
+func (s *Server) handlePostEvent(w http.ResponseWriter, r *http.Request) {
+	var req EventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	event := eventlib.Event{
+		Type:   eventlib.EventType(req.Type),
+		Source: req.Source,
+		Data:   req.Data,
+	}
+
+	if err := s.processor.Push(event); err != nil {
+		s.writeError(w, http.StatusServiceUnavailable, "Failed to queue event")
+		return
+	}
+
+	eventsReceived.WithLabelValues(
+		event.Type.String(),
+		event.Source,
+	).Inc()
+
+	s.writeJSON(w, http.StatusAccepted, map[string]string{
+		"status": "queued",
+	})
+}
+
+func (s *Server) handleBatchEvents(w http.ResponseWriter, r *http.Request) {
+	var req BatchEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	queued := 0
+	failed := 0
+
+	for _, e := range req.Events {
+		event := eventlib.Event{
+			Type:   eventlib.EventType(e.Type),
+			Source: e.Source,
+			Data:   e.Data,
+		}
+
+		if err := s.processor.Push(event); err != nil {
+			failed++
+			s.logger.Warn("Failed to queue event in batch",
+				zap.Error(err),
+				zap.Int("index", queued+failed))
+		} else {
+			queued++
+			eventsReceived.WithLabelValues(
+				event.Type.String(),
+				event.Source,
+			).Inc()
+		}
+	}
+
+	s.writeJSON(w, http.StatusAccepted, map[string]int{
+		"queued": queued,
+		"failed": failed,
+	})
+}
+
+func (s *Server) handleProcess(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	s.processor.Process()
+	processingDuration.Observe(time.Since(start).Seconds())
+
+	s.writeJSON(w, http.StatusOK, map[string]string{
+		"status": "processed",
+	})
+}
+
+func (s *Server) handleProcessAll(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	before := s.processor.EventsProcessed()
+
+	s.processor.ProcessAll()
+
+	after := s.processor.EventsProcessed()
+	processingDuration.Observe(time.Since(start).Seconds())
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":    "processed",
+		"processed": after - before,
+		"duration":  time.Since(start).String(),
+	})
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status := StatusResponse{
+		State:           s.processor.State(),
+		QueueSize:       s.processor.QueueSize(),
+		EventsProcessed: s.processor.EventsProcessed(),
+		Timestamp:       time.Now(),
+	}
+
+	s.writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	health := HealthResponse{
+		Status: "healthy",
+		Checks: map[string]bool{
+			"processor": s.processor.State() == "RUNNING",
+			"queue":     s.processor.QueueSize() < 9000, // 90% threshold
+		},
+	}
+
+	// Determine overall health
+	for _, check := range health.Checks {
+		if !check {
+			health.Status = "unhealthy"
+			w.WriteHeader(http.StatusServiceUnavailable)
+			break
+		}
+	}
+
+	s.writeJSON(w, http.StatusOK, health)
+}
+
+// Helper methods
+func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
+	s.writeJSON(w, status, map[string]string{
+		"error": message,
+	})
+}
+
+func (s *Server) updateMetrics() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		queueSizeGauge.Set(float64(s.processor.QueueSize()))
+	}
+}
+
+func (s *Server) broadcastEvents() {
+	for event := range s.eventBroadcast {
+		s.wsConns.Range(func(key, value interface{}) bool {
+			eventChan := value.(chan eventlib.Event)
+			select {
+			case eventChan <- event:
+			default:
+				// Channel full, skip
+			}
+			return true
+		})
+	}
+}
+
+---- ./eventlibserver/middleware.go ----
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.uber.org/zap"
+)
+
+var (
+	httpDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "Duration of HTTP requests.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"path", "method", "status"})
+
+	httpRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Total number of HTTP requests.",
+	}, []string{"path", "method", "status"})
+)
+
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		s.logger.Info("HTTP request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.Int("status", wrapped.statusCode),
+			zap.Duration("duration", time.Since(start)),
+			zap.String("remote", r.RemoteAddr),
+		)
+	})
+}
+
+func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start)
+		status := fmt.Sprintf("%d", wrapped.statusCode)
+
+		httpDuration.WithLabelValues(r.URL.Path, r.Method, status).Observe(duration.Seconds())
+		httpRequests.WithLabelValues(r.URL.Path, r.Method, status).Inc()
+	})
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+---- ./eventlibserver/models.go ----
+package main
+
+import "time"
+
+// EventRequest represents a single event POST request
+type EventRequest struct {
+	Type   int    `json:"type"`
+	Source string `json:"source"`
+	Data   []byte `json:"data,omitempty"`
+}
+
+// BatchEventRequest represents multiple events
+type BatchEventRequest struct {
+	Events []EventRequest `json:"events"`
+}
+
+// StatusResponse represents the processor status
+type StatusResponse struct {
+	State           string    `json:"state"`
+	QueueSize       int       `json:"queue_size"`
+	EventsProcessed int       `json:"events_processed"`
+	Timestamp       time.Time `json:"timestamp"`
+}
+
+// HealthResponse represents health check response
+type HealthResponse struct {
+	Status string          `json:"status"`
+	Checks map[string]bool `json:"checks"`
+}
+
+// EventMessage for WebSocket streaming
+type EventMessage struct {
+	Type      string    `json:"type"`
+	Source    string    `json:"source"`
+	Data      []byte    `json:"data,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
