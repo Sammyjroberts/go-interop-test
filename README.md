@@ -106,13 +106,12 @@ curl http://localhost:8080/api/v1/health
 curl -X POST http://localhost:8080/api/v1/process/all
 ```
 
----
 **Queue Status:**
 
 ```bash
 curl http://localhost:8080/api/v1/status
 ```
-
+---
 ## Repo Layout
 
 ```
